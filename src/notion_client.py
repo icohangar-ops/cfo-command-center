@@ -5,6 +5,7 @@ Bidirectional read/write wrapper for all finance databases.
 
 import os
 import json
+import time
 import logging
 from typing import Any, Optional
 from datetime import datetime, date
@@ -16,12 +17,23 @@ logger = logging.getLogger("notion_client")
 
 
 class NotionClient:
-    """Low-level Notion REST API wrapper with retry logic."""
+    """Low-level Notion REST API wrapper.
 
-    def __init__(self, token: Optional[str] = None):
+    Retries 429 (rate limit) and 5xx (transient server) responses with
+    exponential backoff, respecting a ``Retry-After`` header when present.
+    """
+
+    # Status codes worth retrying: rate limit + transient server errors.
+    _RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+
+    def __init__(self, token: Optional[str] = None,
+                 retry_attempts: int = 3, retry_delay_seconds: float = 5.0):
         self.token = token or os.getenv("NOTION_TOKEN")
         self.version = os.getenv("NOTION_VERSION", "2022-06-28")
         self.base = "https://api.notion.com/v1"
+        # retry_attempts is the number of *additional* tries after the first.
+        self.retry_attempts = max(0, int(retry_attempts))
+        self.retry_delay_seconds = max(0.0, float(retry_delay_seconds))
         if not self.token:
             raise ValueError("NOTION_TOKEN not set. Pass token or set env var.")
         self._headers = {
@@ -33,17 +45,54 @@ class NotionClient:
     def _request(self, method: str, path: str, body: Optional[dict] = None) -> dict:
         url = f"{self.base}{path}"
         data = json.dumps(body).encode() if body else None
-        req = Request(url, data=data, headers=self._headers, method=method)
-        try:
-            with urlopen(req, timeout=30) as resp:
-                return json.loads(resp.read().decode())
-        except HTTPError as e:
-            error_body = e.read().decode()
-            logger.error(f"HTTP {e.code} on {method} {path}: {error_body}")
-            raise
-        except URLError as e:
-            logger.error(f"URL error on {method} {path}: {e.reason}")
-            raise
+
+        last_exc: Optional[Exception] = None
+        for attempt in range(self.retry_attempts + 1):
+            req = Request(url, data=data, headers=self._headers, method=method)
+            try:
+                with urlopen(req, timeout=30) as resp:
+                    return json.loads(resp.read().decode())
+            except HTTPError as e:
+                last_exc = e
+                error_body = e.read().decode()
+                logger.error(f"HTTP {e.code} on {method} {path}: {error_body}")
+                if e.code in self._RETRYABLE_STATUS and attempt < self.retry_attempts:
+                    delay = self._retry_delay(attempt, getattr(e, "headers", None))
+                    logger.warning(
+                        f"Retrying {method} {path} in {delay:.1f}s "
+                        f"(attempt {attempt + 1}/{self.retry_attempts})"
+                    )
+                    time.sleep(delay)
+                    continue
+                raise
+            except URLError as e:
+                last_exc = e
+                logger.error(f"URL error on {method} {path}: {e.reason}")
+                if attempt < self.retry_attempts:
+                    delay = self._retry_delay(attempt, None)
+                    logger.warning(
+                        f"Retrying {method} {path} in {delay:.1f}s "
+                        f"(attempt {attempt + 1}/{self.retry_attempts})"
+                    )
+                    time.sleep(delay)
+                    continue
+                raise
+        # Should be unreachable: loop either returns or raises.
+        if last_exc:
+            raise last_exc
+        raise RuntimeError(f"Request failed without exception: {method} {path}")
+
+    def _retry_delay(self, attempt: int, headers) -> float:
+        """Compute backoff delay, honoring a Retry-After header when present."""
+        if headers is not None:
+            retry_after = headers.get("Retry-After")
+            if retry_after:
+                try:
+                    return float(retry_after)
+                except (TypeError, ValueError):
+                    pass
+        # Exponential backoff: base * 2**attempt.
+        return self.retry_delay_seconds * (2 ** attempt)
 
     # ── Query ───────────────────────────────────────────────────────────
     def query_database(self, database_id: str, filter_obj: Optional[dict] = None,

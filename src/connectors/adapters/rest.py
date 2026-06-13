@@ -22,6 +22,7 @@ Configuration via extra_params:
 
 import logging
 import json
+import time
 from typing import Optional
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
@@ -33,6 +34,9 @@ logger = logging.getLogger("connector.rest")
 
 class RESTConnector(BaseConnector):
     """Generic REST API connector for custom ERP integrations."""
+
+    # Status codes worth retrying: rate limit + transient server errors.
+    RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 
     DEFAULT_ENDPOINTS = {
         "vendors": {"path": "/api/vendors", "response_key": "data"},
@@ -90,6 +94,52 @@ class RESTConnector(BaseConnector):
         except Exception as e:
             return {"status": "error", "message": str(e)}
 
+    def _retry_delay(self, attempt: int, headers) -> float:
+        """Compute backoff delay, honoring a Retry-After header when present."""
+        if headers is not None:
+            retry_after = headers.get("Retry-After")
+            if retry_after:
+                try:
+                    return float(retry_after)
+                except (TypeError, ValueError):
+                    pass
+        base = max(0.0, float(self.config.retry_delay_seconds))
+        return base * (2 ** attempt)
+
+    def _read_with_retry(self, req: Request) -> bytes:
+        """Execute a request, retrying 429/5xx and transient errors with backoff."""
+        attempts = max(0, int(self.config.retry_attempts))
+        last_exc: Optional[Exception] = None
+        for attempt in range(attempts + 1):
+            try:
+                with urlopen(req, timeout=self.config.timeout_seconds) as resp:
+                    return resp.read()
+            except HTTPError as e:
+                last_exc = e
+                if e.code in self.RETRYABLE_STATUS and attempt < attempts:
+                    delay = self._retry_delay(attempt, getattr(e, "headers", None))
+                    self.logger.warning(
+                        f"REST HTTP {e.code}; retrying in {delay:.1f}s "
+                        f"(attempt {attempt + 1}/{attempts})"
+                    )
+                    time.sleep(delay)
+                    continue
+                raise
+            except URLError as e:
+                last_exc = e
+                if attempt < attempts:
+                    delay = self._retry_delay(attempt, None)
+                    self.logger.warning(
+                        f"REST request error ({e.reason}); retrying in {delay:.1f}s "
+                        f"(attempt {attempt + 1}/{attempts})"
+                    )
+                    time.sleep(delay)
+                    continue
+                raise
+        if last_exc:
+            raise last_exc
+        raise RuntimeError("REST request failed without exception")
+
     def _rest_get(self, dataset: str) -> list[dict]:
         """Execute a REST GET for a dataset and extract the response array."""
         endpoint = self.endpoints.get(dataset, {})
@@ -105,8 +155,7 @@ class RESTConnector(BaseConnector):
         req = Request(url, headers=headers, method="GET")
 
         try:
-            with urlopen(req, timeout=self.config.timeout_seconds) as resp:
-                data = json.loads(resp.read().decode())
+            data = json.loads(self._read_with_retry(req).decode())
 
             # Navigate to the response key (supports nested keys like "data.items")
             keys = response_key.split(".")

@@ -75,8 +75,11 @@ class WebhookHandler(BaseHTTPRequestHandler):
     def _verify_signature(self, body: bytes, signature: str) -> bool:
         if not WEBHOOK_SECRET:
             return True
+        # Strip a common 'sha256=' prefix that webhook senders prepend.
+        if signature.startswith("sha256="):
+            signature = signature[len("sha256="):]
         expected = hmac.new(
-            WEBHOOK_SECRET.encode(), body, hashlib.sha256
+            WEBHOOK_SECRET.encode(), body, digestmod=hashlib.sha256
         ).hexdigest()
         return hmac.compare_digest(expected, signature)
 
