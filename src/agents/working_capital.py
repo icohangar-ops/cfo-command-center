@@ -158,9 +158,14 @@ class WorkingCapitalAgent:
         )
         logger.info(f"Wrote {len(analysis['recommendations'])} recommendations to WC Tracker")
 
-        # Also append insights to CFO Command Center page
+        # Also append insights to CFO Command Center page. Guard against
+        # duplicate content when a webhook run and a batch run fire for the
+        # same period concurrently — key on the period-tagged heading.
         insights = self._format_insights(analysis)
-        self.client.append_blocks(config.PAGE_CFO_CENTER, insights)
+        self.client.append_blocks_idempotent(
+            config.PAGE_CFO_CENTER, insights,
+            dedup_key=f"wc-analysis:{analysis['period']}",
+        )
         logger.info("Appended insights to CFO Command Center page")
 
     def _format_insights(self, analysis: dict) -> list[dict]:

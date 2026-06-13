@@ -244,5 +244,9 @@ class PaymentOptimizationAgent:
             }
         })
 
-        self.client.append_blocks(config.PAGE_CFO_CENTER, blocks)
+        # Dedup concurrent webhook + batch write-backs for the same day.
+        self.client.append_blocks_idempotent(
+            config.PAGE_CFO_CENTER, blocks,
+            dedup_key=f"payment-optimization:{datetime.utcnow().strftime('%Y-%m-%d')}",
+        )
         logger.info("Payment optimization summary written to CFO page")

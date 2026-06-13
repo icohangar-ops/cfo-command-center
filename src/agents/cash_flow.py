@@ -208,5 +208,9 @@ class CashFlowAgent:
             }
         })
 
-        self.client.append_blocks(config.PAGE_CFO_CENTER, blocks)
+        # Dedup concurrent webhook + batch write-backs for the same day.
+        self.client.append_blocks_idempotent(
+            config.PAGE_CFO_CENTER, blocks,
+            dedup_key=f"cash-flow-analysis:{datetime.utcnow().strftime('%Y-%m-%d')}",
+        )
         logger.info(f"Wrote cash flow analysis to CFO page ({len(analysis['alerts'])} alerts)")

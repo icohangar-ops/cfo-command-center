@@ -12,8 +12,18 @@ from datetime import datetime, date
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 
+from cubiczan_resilience import FileIdempotencyStore
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("notion_client")
+
+# Single-host, file-backed store shared across webhook + batch processes so a
+# given (page, dedup-key) write-back executes at most once. Path is overridable
+# via env for deployments with a writable shared volume.
+_WRITEBACK_STORE_PATH = os.getenv(
+    "NOTION_WRITEBACK_STATE", os.path.join(os.path.expanduser("~"), ".cfo_notion_writebacks.json")
+)
+_writeback_store = FileIdempotencyStore(_WRITEBACK_STORE_PATH)
 
 
 class NotionClient:
@@ -138,6 +148,23 @@ class NotionClient:
         return self._request("PATCH", f"/blocks/{page_id}/children", {
             "children": children,
         })
+
+    def append_blocks_idempotent(self, page_id: str, children: list[dict],
+                                 dedup_key: str) -> Optional[dict]:
+        """Append blocks at most once for a given (page, dedup_key).
+
+        Guards against duplicate CFO page content when a webhook-triggered run
+        and a scheduled batch run fire for the same period concurrently. The
+        first caller to claim ``dedup_key`` performs the append; later callers
+        with the same key become no-ops and return ``None``. ``dedup_key``
+        should be timestamp/period-tagged (e.g. the analysis heading text).
+        """
+        store_key = f"{page_id}:{dedup_key}"
+        # First writer wins; mark_done is atomic and does not overwrite.
+        if not _writeback_store.mark_done(store_key):
+            logger.info(f"Skipping duplicate write-back for {store_key!r}")
+            return None
+        return self.append_blocks(page_id, children)
 
     # ── Get Page ────────────────────────────────────────────────────────
     def get_page(self, page_id: str) -> dict:
